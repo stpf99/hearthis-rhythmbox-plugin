@@ -1,0 +1,9 @@
+[Plugin]
+Module=hearthis
+Loader=python3
+Name=HearThis.at
+Description=Stream music from HearThis.at — browse artists, genres, and play tracks directly in Rhythmbox.
+Authors=HearThis Plugin
+Copyright=Copyright © 2024
+Website=https://hearthis.at
+Version=1.0
