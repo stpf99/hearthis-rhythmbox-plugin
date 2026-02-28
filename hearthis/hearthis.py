@@ -143,6 +143,13 @@ class HearThisSource(RB.Source):
         player.connect("playing-song-changed", self._on_playing_song_changed)
         self._pending_dur_entry = None   # wpis czekający na potwierdzenie dur
 
+        # Seeking state — wzorowane na GTK4 app (is_seeking flag + polling duration)
+        # W RB seek bar jest wbudowany, ale duration musi być znany zanim
+        # użytkownik spróbuje przewinąć. Poolingujemy get_playing_length()
+        # dopóki duration nie zostanie potwierdzone przez GStreamer.
+        self._seeking_confirmed = False
+        GLib.timeout_add(500, self._poll_duration)
+
         # RB.ExtDB("album-art") — to samo co używa plugin cover art
         try:
             self._art_store = RB.ExtDB(name="album-art")
@@ -308,13 +315,6 @@ class HearThisSource(RB.Source):
         toolbar.pack_start(self._local_filter, False, False, 0)
 
         toolbar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 2)
-
-        # Pre-download toggle
-        self._predown_btn = Gtk.ToggleButton(label="📥 Pre-buf")
-        self._predown_btn.set_tooltip_text(
-            "Włączone: przed odtworzeniem pobierz utwór do cache — umożliwia przewijanie")
-        self._predown_btn.set_active(False)
-        toolbar.pack_start(self._predown_btn, False, False, 0)
 
         # Pobierz wszystkie widoczne (z download_url) do ~/Muzyka/HearThis.at
         self._btn_dl_all = Gtk.Button(label="⬇ Pobierz widok")
@@ -517,29 +517,66 @@ class HearThisSource(RB.Source):
 
     def _on_elapsed_changed(self, player, elapsed_ns):
         """
-        Gdy GStreamer zaraportuje postęp (elapsed_ns > 0), możemy odczytać
-        rzeczywisty czas trwania i zapisać do DB — to umożliwia seek slider.
+        Gdy GStreamer zaraportuje postęp (elapsed_ns > 0), próbujemy odczytać
+        rzeczywisty czas trwania — wzorowane na GTK4 app update_position().
+        Aktualizujemy DURATION w DB tylko gdy wartość się zmieniła.
         """
         if not self._pending_dur_entry:
             return
+        if elapsed_ns <= 0:
+            return
         try:
-            # get_playing_length zwraca długość w nanosekundach
             dur_ns = player.get_playing_length()
             if dur_ns and dur_ns > 0:
                 dur_sec = int(dur_ns / 1e9)
                 entry   = self._pending_dur_entry
                 db      = self._db
-                cur     = db.entry_get(entry, RB.RhythmDBPropType.DURATION)
-                if not cur or cur != dur_sec:
+                try:
+                    cur = db.entry_get(entry, RB.RhythmDBPropType.DURATION)
+                except Exception:
+                    cur = 0
+                if not cur or abs(cur - dur_sec) > 1:
                     db.entry_set(entry, RB.RhythmDBPropType.DURATION, dur_sec)
                     db.commit()
                     print(f"[HearThis] Duration confirmed by GStreamer: {dur_sec}s")
                 self._pending_dur_entry = None
-        except Exception as e:
-            pass  # get_playing_length może nie istnieć w tej wersji RB
+                self._seeking_confirmed = True
+        except Exception:
+            pass
+
+    def _poll_duration(self):
+        """
+        Wzorowane na GTK4 app update_position() — cyklicznie sprawdza duration
+        (co 500 ms) dopóki nie zostanie potwierdzone przez GStreamer.
+        Pozwala to na natychmiastowe ustawienie duration po starcie streamu.
+        """
+        if self._seeking_confirmed or not self._pending_dur_entry:
+            return True  # kontynuuj polling (nowy utwór może być za chwilę)
+        try:
+            player = self._shell.props.shell_player
+            dur_ns = player.get_playing_length()
+            if dur_ns and dur_ns > 0:
+                dur_sec = int(dur_ns / 1e9)
+                entry   = self._pending_dur_entry
+                db      = self._db
+                try:
+                    cur = db.entry_get(entry, RB.RhythmDBPropType.DURATION)
+                except Exception:
+                    cur = 0
+                if not cur or abs(cur - dur_sec) > 1:
+                    db.entry_set(entry, RB.RhythmDBPropType.DURATION, dur_sec)
+                    db.commit()
+                    print(f"[HearThis] Duration polled: {dur_sec}s")
+                self._pending_dur_entry = None
+                self._seeking_confirmed = True
+        except Exception:
+            pass
+        return True  # GLib.timeout_add — kontynuuj
 
     def _on_playing_song_changed(self, player, entry):
-        """Gdy zmienia się grający utwór — wyślij okładkę do RB art store."""
+        """Gdy zmienia się grający utwór — wyślij okładkę do RB art store i resetuj seeking."""
+        # Reset flagi seeking przy każdej zmianie utworu
+        self._seeking_confirmed = False
         if entry is None or self._art_store is None:
             return
         try:
@@ -586,32 +623,31 @@ class HearThisSource(RB.Source):
         return None
 
     def _bg_push_art_pixbuf(self, key, small_pixbuf, fallback_url):
-        """Skaluj miniaturkę do 256px i wstaw do art store."""
+        """Skaluj miniaturkę i wstaw do art store. RB.ExtDB.store() = 4 args."""
         if not self._art_store:
             return
         try:
+            pixbuf_to_store = None
             # Najpierw spróbuj pobrać pełny rozmiar z URL
             if fallback_url:
                 p = fetch_pixbuf(fallback_url)
                 if p:
-                    # Skaluj do 256×256 zachowując proporcje
                     w, h = p.get_width(), p.get_height()
                     scale = 256 / max(w, h, 1)
                     nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
-                    big = p.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
-                    for m in ("store", "store_pixbuf"):
-                        fn = getattr(self._art_store, m, None)
-                        if fn:
-                            fn(key, RB.ExtDBSourceType.SEARCH, big, None)
-                            print(f"[HearThis] Art stored (full) via {m}: {nw}x{nh}")
-                            return
+                    pixbuf_to_store = p.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
             # Fallback: użyj miniaturki z store
+            if pixbuf_to_store is None:
+                pixbuf_to_store = small_pixbuf
             for m in ("store", "store_pixbuf"):
                 fn = getattr(self._art_store, m, None)
                 if fn:
-                    fn(key, RB.ExtDBSourceType.SEARCH, small_pixbuf, None)
-                    print(f"[HearThis] Art stored (thumb) via {m}")
-                    return
+                    try:
+                        fn(key, RB.ExtDBSourceType.SEARCH, pixbuf_to_store)
+                        print(f"[HearThis] Art stored via {m}")
+                        return
+                    except Exception as e:
+                        print(f"[HearThis] {m} error: {e}")
         except Exception as e:
             print(f"[HearThis] push_art_pixbuf error: {e}")
 
@@ -627,7 +663,7 @@ class HearThisSource(RB.Source):
                 fn = getattr(self._art_store, m, None)
                 if fn:
                     try:
-                        fn(key, RB.ExtDBSourceType.SEARCH, big, None)
+                        fn(key, RB.ExtDBSourceType.SEARCH, big)
                         print(f"[HearThis] Art stored via {m}")
                         return
                     except Exception as e:
@@ -982,13 +1018,6 @@ class HearThisSource(RB.Source):
         item_play.connect("activate", lambda w: self._activate_path(path))
         menu.append(item_play)
 
-        # Pre-buf play (zawsze dostępne)
-        item_prebuf = Gtk.MenuItem(label="📥  Buforuj i odtwórz (seekable)")
-        item_prebuf.connect("activate",
-            lambda w, u=stream_url, t=title, a=artist: threading.Thread(
-                target=self._prebuf_and_play, args=(u, t, a), daemon=True).start())
-        menu.append(item_prebuf)
-
         item_queue = Gtk.MenuItem(label="➕  Dodaj do kolejki")
         item_queue.connect("activate", lambda w: self._add_path_to_queue(path))
         menu.append(item_queue)
@@ -1041,14 +1070,10 @@ class HearThisSource(RB.Source):
                 daemon=True
             ).start()
         elif dl_state == "":
-            # brak download_url — zaoferuj pre-buf do cache
-            threading.Thread(
-                target=self._prebuf_and_play,
-                args=(stream_url, title, artist),
-                daemon=True
-            ).start()
+            # brak download_url — brak akcji
+            self._set_status("Brak linku pobierania dla tego utworu.")
 
-    # ── Pobieranie i pre-buffering ────────────────────────────
+    # ── Pobieranie ────────────────────────────────────────────
 
     def _update_row_state(self, path, new_state):
         """Uaktualnij COL_DLSTATE dla wiersza (może być w sort_model)."""
@@ -1062,49 +1087,6 @@ class HearThisSource(RB.Source):
             except Exception as e:
                 print(f"[HearThis] row state update error: {e}")
         GLib.idle_add(_do)
-
-    def _prebuf_and_play(self, stream_url, title, artist):
-        """
-        Pobierz utwór do pliku cache, potem odtwórz z dysku — umożliwia seeking.
-        Jeśli pre-buf toggle jest wyłączony — użyj normalnego odtwarzania.
-        """
-        if not self._predown_btn.get_active():
-            # Normalny tryb — tylko resolve i play
-            real_url = self._resolve_url(stream_url)
-            if real_url:
-                _s, fsize = self._check_seekable_and_size(real_url)
-                GLib.idle_add(self._play_url, real_url, title, artist, "", 0, fsize)
-            return
-
-        GLib.idle_add(self._set_status, f"⏳ Buforuję: {title}…")
-        cache_path = self._cache_path_for(stream_url)
-
-        if not os.path.exists(cache_path):
-            real_url = self._resolve_url(stream_url)
-            if not real_url:
-                GLib.idle_add(self._set_status, f"❌ Brak URL dla: {title}")
-                return
-            ok = self._download_file(real_url, cache_path)
-            if not ok:
-                GLib.idle_add(self._set_status, f"❌ Błąd buforowania: {title}")
-                return
-
-        local_uri = "file://" + cache_path
-        GLib.idle_add(self._set_status, f"▶ Odtwarzam z cache: {title}")
-        # Pobierz cover_url z _cover_map lub zostaw puste
-        cover_url = self._cover_map.get(stream_url, "")
-        # Plik lokalny — pełny seeking
-        dur_sec   = self._get_duration_from_cache(cache_path)
-        fsize     = os.path.getsize(cache_path)
-        GLib.idle_add(self._play_url, local_uri, title, artist, cover_url, dur_sec, fsize)
-
-    def _get_duration_from_cache(self, path):
-        """Szacuj czas trwania z rozmiaru MP3 (założenie: 128 kbps)."""
-        try:
-            size = os.path.getsize(path)
-            return max(1, int(size * 8 / 128000))
-        except Exception:
-            return 0
 
     def _download_file(self, url, dest_path, progress_cb=None):
         """Pobierz plik z URL do dest_path. Zwraca True/False."""
@@ -1226,19 +1208,24 @@ class HearThisSource(RB.Source):
         artist    = self._sort_model.get_value(it, self.COL_ARTIST)
         cover_url = self._sort_model.get_value(it, self.COL_COVER)
         dur_sec   = self._sort_model.get_value(it, self.COL_DURSEC)
+        pixbuf    = self._sort_model.get_value(it, self.COL_PIXBUF)
         if url:
-            if self._predown_btn.get_active():
+            # Natychmiastowe wysłanie okładki z klikniętego wiersza do głównego
+            # okna Rhythmbox — wzorowane na GTK4 app (cover art z aktualnego obiektu)
+            if pixbuf and self._art_store:
+                album = "hearthis.at"
+                key   = RB.ExtDBKey.create_storage("album", album)
+                key.add_field("artist", artist)
                 threading.Thread(
-                    target=self._prebuf_and_play,
-                    args=(url, title, artist),
+                    target=self._bg_push_art_pixbuf,
+                    args=(key, pixbuf, cover_url),
                     daemon=True
                 ).start()
-            else:
-                threading.Thread(
-                    target=self._resolve_and_play,
-                    args=(url, title, artist, cover_url, dur_sec),
-                    daemon=True
-                ).start()
+            threading.Thread(
+                target=self._resolve_and_play,
+                args=(url, title, artist, cover_url, dur_sec),
+                daemon=True
+            ).start()
 
     def _add_path_to_queue(self, path):
         it = self._sort_model.get_iter(path)
@@ -1392,8 +1379,12 @@ class HearThisSource(RB.Source):
                 cl     = resp.headers.get("Content-Length", "") or resp.headers.get("X-Content-Length", "")
                 cr     = resp.headers.get("Content-Range", "")
                 seekable = (accept == "bytes") or bool(cr)
+                # Content-Range: bytes 0-0/TOTAL — wyciągnij TOTAL, nie Content-Length (=1)
                 try:
-                    size = int(cl)
+                    if "/" in cr:
+                        size = int(cr.split("/")[-1])
+                    else:
+                        size = int(cl)
                 except Exception:
                     size = 0
                 print(f"[HearThis] HEAD: Accept-Ranges={accept!r} CL={cl!r} CR={cr!r} -> seekable={seekable} size={size}")
@@ -1464,10 +1455,9 @@ class HearThisSource(RB.Source):
             print(f"[HearThis] BŁĄD: wszystkie entry_new zawiodły dla {url}")
             return None
 
-        db.entry_set(entry, RB.RhythmDBPropType.TITLE,             title)
-        db.entry_set(entry, RB.RhythmDBPropType.ARTIST,            artist)
-        db.entry_set(entry, RB.RhythmDBPropType.ALBUM,             "hearthis.at")
-        db.entry_set(entry, RB.RhythmDBPropType.STREAM_SONG_TITLE, title)
+        db.entry_set(entry, RB.RhythmDBPropType.TITLE,  title)
+        db.entry_set(entry, RB.RhythmDBPropType.ARTIST, artist)
+        db.entry_set(entry, RB.RhythmDBPropType.ALBUM,  "hearthis.at")
 
         # KLUCZOWE dla seekowania: czas trwania musi być w DB przed play()
         if dur_sec > 0:
