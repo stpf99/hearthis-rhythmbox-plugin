@@ -11,7 +11,7 @@ gi.require_version("RB", "3.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 
-from gi.repository import GObject, GLib, Gtk, Gio, Peas, RB, GdkPixbuf
+from gi.repository import GObject, GLib, Gtk, Gdk, Gio, Peas, RB, GdkPixbuf
 import urllib.request
 import urllib.parse
 import json
@@ -128,6 +128,7 @@ class HearThisSource(RB.Source):
         self._current_page  = 1
         self._query_text    = ""
         self._current_genre = ""
+        self._current_artist = ""   # aktualnie przeglądany artysta (do subscribe)
         self._sort_col      = self.COL_TITLE
         self._sort_asc      = True
 
@@ -335,8 +336,16 @@ class HearThisSource(RB.Source):
         self._artist_lbl.set_xalign(0.0)
         self._artist_lbl.set_line_wrap(True)
         self._artist_lbl.set_max_width_chars(100)
+
+        self._btn_subscribe = Gtk.Button(label="📻 Subskrybuj podcast")
+        self._btn_subscribe.set_tooltip_text(
+            "Dodaj feed RSS tego artysty do zakładki Podcasty w Rhythmbox")
+        self._btn_subscribe.set_no_show_all(True)
+        self._btn_subscribe.connect("clicked", lambda w: self._subscribe_artist_podcast())
+
         self._info_box.pack_start(self._avatar_img, False, False, 0)
         self._info_box.pack_start(self._artist_lbl, True, True, 0)
+        self._info_box.pack_start(self._btn_subscribe, False, False, 0)
 
         # ── Status ───────────────────────────
         self._status_lbl = Gtk.Label(label="Wczytuję polecane…")
@@ -942,17 +951,21 @@ class HearThisSource(RB.Source):
             self._genre_combo.append_text(g)
 
     def _show_artist_info(self, avatar_url, description, username):
+        self._current_artist = username
         self._info_box.set_no_show_all(False)
         desc = strip_html(description)
         if len(desc) > 300:
             desc = desc[:300] + "…"
         self._artist_lbl.set_text(f"@{username}  {desc}")
+        self._btn_subscribe.set_no_show_all(False)
         self._info_box.show_all()
         if avatar_url:
             threading.Thread(target=self._bg_load_avatar, args=(avatar_url,), daemon=True).start()
 
     def _hide_artist_info(self):
+        self._current_artist = ""
         GLib.idle_add(self._info_box.hide)
+        GLib.idle_add(self._btn_subscribe.hide)
 
     def _bg_load_avatar(self, url):
         p = fetch_pixbuf(url)
@@ -1050,6 +1063,10 @@ class HearThisSource(RB.Source):
             item_artist = Gtk.MenuItem(label=f"🎵  Przejdź do artysty: @{username}")
             item_artist.connect("activate", lambda w, u=username: self._go_to_artist(u))
             menu.append(item_artist)
+
+            item_sub = Gtk.MenuItem(label=f"📻  Subskrybuj podcast: @{username}")
+            item_sub.connect("activate", lambda w, u=username: self._subscribe_podcast(u))
+            menu.append(item_sub)
 
         menu.show_all()
         menu.popup_at_pointer(event)
@@ -1196,6 +1213,125 @@ class HearThisSource(RB.Source):
             for dl_u, t, a in jobs:
                 self._download_to_library(dl_u, t, a)
         threading.Thread(target=_dl_all, daemon=True).start()
+
+    def _subscribe_artist_podcast(self):
+        """Pokaż URL RSS aktualnie wyświetlanego artysty."""
+        if self._current_artist:
+            self._subscribe_podcast(self._current_artist)
+
+    def _subscribe_podcast(self, username):
+        """
+        Sprawdź czy użytkownik ma dedykowaną stronę podcastu
+        (https://hearthis.at/{user}/podcast/) — jeśli tak, użyj jej RSS.
+        W przeciwnym razie użyj ogólnego RSS konta.
+        Wyświetla dialog z URL gotowym do skopiowania.
+        """
+        if not username:
+            return
+        # Sprawdzenie w tle, żeby nie blokować UI
+        threading.Thread(
+            target=self._bg_detect_and_show_podcast_dialog,
+            args=(username,),
+            daemon=True
+        ).start()
+
+    def _bg_detect_and_show_podcast_dialog(self, username):
+        """Wykryj URL podcastu i pokaż dialog (wątek tła)."""
+        podcast_page = f"https://hearthis.at/{username}/podcast/"
+        rss_generic  = f"https://hearthis.at/{username}/rss/"
+        rss_podcast  = f"https://hearthis.at/{username}/podcast/rss/"
+
+        has_podcast_page = False
+        try:
+            req = urllib.request.Request(
+                podcast_page,
+                method="HEAD",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                has_podcast_page = (resp.status == 200)
+        except Exception:
+            has_podcast_page = False
+
+        if has_podcast_page:
+            rss_url      = rss_podcast
+            page_url     = podcast_page
+            label_rss    = "RSS podcastu"
+        else:
+            rss_url      = rss_generic
+            page_url     = None
+            label_rss    = "RSS konta"
+
+        GLib.idle_add(
+            self._show_podcast_dialog,
+            username, rss_url, page_url, label_rss
+        )
+
+    def _show_podcast_dialog(self, username, rss_url, page_url, label_rss):
+        dlg = Gtk.Dialog(title="Subskrypcja podcastu", flags=0)
+        dlg.set_resizable(False)
+        dlg.add_button("Zamknij", Gtk.ResponseType.CLOSE)
+
+        area = dlg.get_content_area()
+        area.set_spacing(8)
+        area.set_margin_start(12); area.set_margin_end(12)
+        area.set_margin_top(12);   area.set_margin_bottom(4)
+
+        # Nagłówek
+        lbl_head = Gtk.Label()
+        if page_url:
+            markup = (
+                f"<b>@{username}</b> ma dedykowaną stronę podcastu.\n\n"
+                "Skopiuj poniższy adres RSS, następnie w Rhythmbox:\n"
+                "<b>Podcasty → prawy klik → Nowy podcast…</b>"
+            )
+        else:
+            markup = (
+                f"<b>@{username}</b> — ogólny feed RSS konta.\n\n"
+                "Skopiuj poniższy adres RSS, następnie w Rhythmbox:\n"
+                "<b>Podcasty → prawy klik → Nowy podcast…</b>"
+            )
+        lbl_head.set_markup(markup)
+        lbl_head.set_xalign(0.0)
+        lbl_head.set_line_wrap(True)
+        area.pack_start(lbl_head, False, False, 0)
+
+        # Pole RSS
+        area.pack_start(Gtk.Label(label=label_rss + ":", xalign=0.0), False, False, 0)
+        entry_rss = Gtk.Entry()
+        entry_rss.set_text(rss_url)
+        entry_rss.set_editable(False)
+        entry_rss.set_width_chars(54)
+        entry_rss.connect("realize", lambda w: w.select_region(0, -1))
+        area.pack_start(entry_rss, False, False, 0)
+
+        btn_copy = Gtk.Button(label="📋 Kopiuj RSS do schowka")
+        def _copy_rss(*_):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(rss_url, -1)
+            btn_copy.set_label("✅ Skopiowano!")
+        btn_copy.connect("clicked", _copy_rss)
+        area.pack_start(btn_copy, False, False, 0)
+
+        # Opcjonalne: link do strony podcastu
+        if page_url:
+            area.pack_start(Gtk.Separator(), False, False, 4)
+            area.pack_start(
+                Gtk.Label(label="Strona podcastu:", xalign=0.0),
+                False, False, 0)
+            entry_page = Gtk.Entry()
+            entry_page.set_text(page_url)
+            entry_page.set_editable(False)
+            entry_page.set_width_chars(54)
+            area.pack_start(entry_page, False, False, 0)
+
+            btn_open = Gtk.Button(label="🌐 Otwórz w przeglądarce")
+            btn_open.connect("clicked",
+                lambda w, u=page_url: Gio.AppInfo.launch_default_for_uri(u, None))
+            area.pack_start(btn_open, False, False, 0)
+
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
 
     def _go_to_artist(self, username):
         self._search_entry.set_text(username)
